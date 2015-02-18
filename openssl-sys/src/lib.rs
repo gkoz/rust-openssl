@@ -464,12 +464,14 @@ extern "C" {
     pub fn EVP_BytesToKey(typ: *const EVP_CIPHER, md: *const EVP_MD,
                           salt: *const u8, data: *const u8, datalen: c_int,
                           count: c_int, key: *mut u8, iv: *mut u8) -> c_int;
+    pub fn EVP_CIPHER_key_length(ctx: *const EVP_CIPHER) -> c_int;
 
     pub fn EVP_CIPHER_CTX_new() -> *mut EVP_CIPHER_CTX;
     pub fn EVP_CIPHER_CTX_set_padding(ctx: *mut EVP_CIPHER_CTX, padding: c_int) -> c_int;
     pub fn EVP_CIPHER_CTX_free(ctx: *mut EVP_CIPHER_CTX);
     pub fn EVP_CIPHER_CTX_ctrl(ctx: *mut EVP_CIPHER_CTX, type_: c_int,
                                arg: c_int, ptr: *mut c_void) -> c_int;
+    pub fn EVP_CIPHER_CTX_iv_length(ctx: *mut EVP_CIPHER_CTX) -> c_int;
 
     pub fn EVP_CipherInit(ctx: *mut EVP_CIPHER_CTX, evp: *const EVP_CIPHER,
                           key: *const u8, iv: *const u8, mode: c_int) -> c_int;
