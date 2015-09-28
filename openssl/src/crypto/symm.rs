@@ -33,7 +33,7 @@
 //! {
 //!     let mut w = Writer::new(&mut dec, &mut res);
 //!     assert!(w.write_all(ct).is_ok());
-//!     assert!(w.end().is_ok());
+//!     assert!(w.finish().is_ok());
 //! }
 //! assert!(res == b"secret!");
 //! ```
@@ -41,6 +41,7 @@
 #![allow(unused_imports)]
 use std::{error, fmt, mem, ptr};
 use std::error::Error as StdError;
+use std::fmt::Debug;
 use libc::{c_int, c_void};
 use std::io;
 use std::io::prelude::*;
@@ -49,7 +50,7 @@ use ffi;
 
 const MAX_BLOCK_LEN: usize = ffi::EVP_MAX_BLOCK_LENGTH;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
     Created,
     Reset,
@@ -59,14 +60,14 @@ enum State {
 
 use self::State::*;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Direction {
     Decrypt,
     Encrypt,
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Type {
     AES_128_ECB,
     AES_128_CBC,
@@ -90,7 +91,7 @@ pub enum Type {
 }
 
 /// Selects AES key size
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Aes {
     Aes128,
     Aes256,
@@ -157,6 +158,24 @@ impl From<io::Error> for Error {
     }
 }
 
+/// An error returned when unwrapping a `Writer` fails.
+// It currently seems impossible to implement Error for this struct in stable rust
+#[derive(Debug)]
+pub struct WriterIntoInnerError<C, W> {
+    /// The actual error.
+    pub cause: Error,
+    /// The `cipher` supplied to `Writer::new`.
+    pub cipher: C,
+    /// The `writer` supplied to `Writer::new`.
+    pub writer: W,
+}
+
+impl<C, W> fmt::Display for WriterIntoInnerError<C, W> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.cause, fmt)
+    }
+}
+
 macro_rules! chk {
     ($inp:expr) => (
         {
@@ -187,6 +206,19 @@ pub trait Cipher {
                     -> Result<Self::FinishRetType, Error>;
 }
 
+impl<'a, T: Cipher> Cipher for &'a mut T {
+    type FinishRetType = T::FinishRetType;
+
+    fn apply(&mut self, data: &[u8], buf: &mut [u8]) -> usize {
+        (*self).apply(data, buf)
+    }
+
+    fn unified_finish(&mut self, buf: &mut [u8], out_len: &mut usize)
+            -> Result<Self::FinishRetType, Error> {
+        (*self).unified_finish(buf, out_len)
+    }
+}
+
 /*
 /// A cipher that works on large blocks (sectors)
 trait SectorMode {
@@ -195,37 +227,56 @@ trait SectorMode {
 */
 
 /// An adapter for using ciphers as `Write`rs
-pub struct Writer<'a, T: 'a> {
-    cipher: &'a mut T,
-    writer: &'a mut Write,
+pub struct Writer<C, W> {
+    cipher: C,
+    writer: W,
 }
 
 const WRITER_BUFFER_LEN: usize = 16384;
 
-impl <'a, T: Cipher> Writer<'a, T> {
+impl <C: Cipher, W: Write> Writer<C, W> {
     /// Creates a `Write` adapter for the `cipher`. The output is written
     /// to the `writer`.
     /// The `cipher` has to be `start`ed beforehand.
-    pub fn new(cipher: &'a mut T, writer: &'a mut Write) -> Writer<'a, T> {
+    pub fn new(cipher: C, writer: W) -> Self {
         Writer { cipher: cipher, writer: writer }
     }
 
     /// Finishes the cipher and writes any remaining data to the writer.
     ///
     /// Returns a cipher mode-specific result.
-    pub fn end(self) -> Result<<T as Cipher>::FinishRetType, Error> {
+    pub fn finish(self) -> Result<C::FinishRetType, Error> {
+        match self.into_inner() {
+            Ok((res, _, _)) => Ok(res),
+            Err(WriterIntoInnerError { cause, .. }) => Err(cause),
+        }
+    }
+
+    /// Finishes the cipher and writes any remaining data to the writer
+    /// returning both.
+    ///
+    /// On success returns a tuple containing the cipher mode-specific result,
+    /// the `cipher` and the `writer` supplied at creation time. In case of
+    /// an error returns `WriterIntoInnerError`.
+    pub fn into_inner(self) -> Result<(C::FinishRetType, C, W), WriterIntoInnerError<C, W>> {
         let mut buf = [0; MAX_BLOCK_LEN];
         let mut len = 0;
-        let res = try!(self.cipher.unified_finish(&mut buf, &mut len));
-        if len > 0 {
-            try!(self.writer.write_all(&buf[..len]));
+        let Writer { mut cipher, mut writer } = self;
+        let res = || -> Result<_, Error> {
+            let res = try!(cipher.unified_finish(&mut buf, &mut len));
+            if len > 0 {
+                try!(writer.write_all(&buf[..len]));
+            }
+            Ok(res)
+        }();
+        match res {
+            Ok(val) => Ok((val, cipher, writer)),
+            Err(err) => Err(WriterIntoInnerError { cause: err, cipher: cipher, writer: writer }),
         }
-        try!(self.writer.flush());
-        Ok(res)
     }
 }
 
-impl <'a, T: Cipher> Write for Writer<'a, T> {
+impl <C: Cipher, W: Write> Write for Writer<C, W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let mut buf = [0; WRITER_BUFFER_LEN + MAX_BLOCK_LEN];
         for chunk in data.chunks(WRITER_BUFFER_LEN) {
@@ -249,6 +300,8 @@ trait EvpCipher: Sized {
 }
 
 /// A common cipher interface
+#[allow(raw_pointer_derive)]
+#[derive(Debug)]
 struct Context {
     ctx: *mut ffi::EVP_CIPHER_CTX,
     iv_len: Option<usize>,
@@ -432,6 +485,7 @@ pub mod ecb{
     /// AES in ECB mode without padding.
     ///
     /// The data length needs to be a multiple of AES block length.
+    #[derive(Debug)]
     pub struct EcbRaw {
         context: Context,
     }
@@ -487,6 +541,7 @@ pub mod ecb{
     }
 
     /// AES in ECB mode with padding.
+    #[derive(Debug)]
     pub struct EcbPadded {
         context: Context,
     }
@@ -576,6 +631,7 @@ pub mod cbc {
     /// AES in CBC mode without padding.
     ///
     /// The data length needs to be a multiple of AES block length.
+    #[derive(Debug)]
     pub struct CbcRaw {
         context: Context,
     }
@@ -631,6 +687,7 @@ pub mod cbc {
     }
 
     /// AES in CBC mode with padding.
+    #[derive(Debug)]
     pub struct CbcPadded {
         context: Context,
     }
@@ -721,6 +778,7 @@ pub mod gcm {
     const TAG_LEN: usize = 16;
 
     /// AES in GCM mode authenticated encryption.
+    #[derive(Debug)]
     pub struct GcmEncrypt {
         context: Context,
     }
@@ -773,6 +831,7 @@ pub mod gcm {
     }
 
     /// AES in GCM mode authenticated decryption.
+    #[derive(Debug)]
     pub struct GcmDecrypt {
         context: Context,
     }
@@ -871,6 +930,7 @@ pub mod ctr {
     }
 
     /// AES in CTR mode.
+    #[derive(Debug)]
     pub struct Ctr {
         context: Context,
         counter: u64,
@@ -1400,11 +1460,11 @@ mod tests {
             let mut enc = EcbPadded::new_encrypt(algo, &key);
             enc.start();
             {
-                let mut w = Writer::new(&mut enc, &mut res);
+                let mut w = Writer::new(&mut enc, res);
                 for byte in &pt {
                     assert!(w.write_all(&[*byte]).is_ok());
                 }
-                assert!(w.end().is_ok());
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(ct, res);
 
@@ -1412,11 +1472,11 @@ mod tests {
             let mut dec = EcbPadded::new_decrypt(algo, &key);
             dec.start();
             {
-                let mut w = Writer::new(&mut dec, &mut res);
+                let mut w = Writer::new(&mut dec, res);
                 for byte in &ct {
                     assert!(w.write_all(&[*byte]).is_ok());
                 }
-                assert!(w.end().is_ok());
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(pt, res);
 
@@ -1443,8 +1503,8 @@ mod tests {
                 }
             }
             {
-                let w = Writer::new(&mut enc, &mut res);
-                assert!(w.end().is_ok());
+                let w = Writer::new(&mut enc, res);
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(ct, res);
 
@@ -1458,8 +1518,8 @@ mod tests {
                 }
             }
             {
-                let w = Writer::new(&mut dec, &mut res);
-                assert!(w.end().is_ok());
+                let w = Writer::new(&mut dec, res);
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(pt, res);
 
@@ -1657,11 +1717,11 @@ mod tests {
             let mut enc = CbcPadded::new_encrypt(algo, &key);
             enc.start(&iv);
             {
-                let mut w = Writer::new(&mut enc, &mut res);
+                let mut w = Writer::new(&mut enc, res);
                 for byte in &pt {
                     assert!(w.write_all(&[*byte]).is_ok());
                 }
-                assert!(w.end().is_ok());
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(ct, res);
 
@@ -1669,11 +1729,11 @@ mod tests {
             let mut dec = CbcPadded::new_decrypt(algo, &key);
             dec.start(&iv);
             {
-                let mut w = Writer::new(&mut dec, &mut res);
+                let mut w = Writer::new(&mut dec, res);
                 for byte in &ct {
                     assert!(w.write_all(&[*byte]).is_ok());
                 }
-                assert!(w.end().is_ok());
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(pt, res);
 
@@ -1700,8 +1760,8 @@ mod tests {
                 }
             }
             {
-                let w = Writer::new(&mut enc, &mut res);
-                assert!(w.end().is_ok());
+                let w = Writer::new(&mut enc, res);
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(ct, res);
 
@@ -1715,8 +1775,8 @@ mod tests {
                 }
             }
             {
-                let w = Writer::new(&mut dec, &mut res);
-                assert!(w.end().is_ok());
+                let w = Writer::new(&mut dec, res);
+                res = w.into_inner().unwrap().2;
             }
             assert_eq!(pt, res);
 
