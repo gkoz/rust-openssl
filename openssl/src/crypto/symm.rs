@@ -49,7 +49,7 @@ use ffi;
 
 const MAX_BLOCK_LEN: usize = ffi::EVP_MAX_BLOCK_LENGTH;
 
-#[derive(PartialEq, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum State {
     Created,
     Reset,
@@ -59,14 +59,38 @@ enum State {
 
 use self::State::*;
 
-#[derive(Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Direction {
     Decrypt,
     Encrypt,
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone)]
+pub enum Type {
+    AES_128_ECB,
+    AES_128_CBC,
+    /// Requires the `aes_xts` feature
+    #[cfg(feature = "aes_xts")]
+    AES_128_XTS,
+    #[cfg(feature = "aes_ctr")]
+    AES_128_CTR,
+    //AES_128_GCM,
+
+    AES_256_ECB,
+    AES_256_CBC,
+    /// Requires the `aes_xts` feature
+    #[cfg(feature = "aes_xts")]
+    AES_256_XTS,
+    #[cfg(feature = "aes_ctr")]
+    AES_256_CTR,
+    //AES_256_GCM,
+
+    RC4_128,
+}
+
 /// Selects AES key size
-#[derive(Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Aes {
     Aes128,
     Aes256,
@@ -89,7 +113,7 @@ impl Aes {
 }
 
 /// Indicates a symmetric cipher error
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Error {
     /// The data doesn't end on a cipher block boundary as required by the mode
     IncompleteBlock,
@@ -127,8 +151,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::FromError<io::Error> for Error {
-    fn from_error(err: io::Error) -> Error {
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
         Error::IoError(err)
     }
 }
@@ -196,7 +220,7 @@ impl <'a, T: Cipher> Writer<'a, T> {
         if len > 0 {
             try!(self.writer.write_all(&buf[..len]));
         }
-        self.writer.flush();
+        try!(self.writer.flush());
         Ok(res)
     }
 }
@@ -235,7 +259,7 @@ impl Context {
     fn new<C: EvpCipher>(cipher: C, dir: Direction, key: &[u8]) -> Context {
         ffi::init();
 
-        let mut ctx;
+        let ctx;
         unsafe {
             let evp_cipher = cipher.evp_cipher();
             assert!(key.len() == cipher.key_len(), "Incorrect key length");
@@ -817,7 +841,6 @@ pub mod ctr {
     //! CTR mode
 
     use std::mem;
-    use std::num::Int;
     use super::{Aes, Cipher, Context, Direction, Error};
     use ffi;
 
@@ -922,12 +945,32 @@ mod tests {
     use std::iter::repeat;
     use std::io::prelude::*;
     use std::cmp::max;
-    use std::num::from_str_radix;
     use serialize::hex::FromHex;
     #[cfg(feature = "aes_ctr")]
     use super::ctr::{Ctr};
     #[cfg(feature = "aes_gcm")]
     use super::gcm::{GcmEncrypt, GcmDecrypt};
+
+    macro_rules! assert_match {
+        ($val:expr, $pat:pat) =>
+        (
+            match $val {
+                $pat => (),
+                val => panic!("assertion failed: `(left matches right)` \
+                                (left: `{:?}`, right: `{}`)", val, stringify!($pat)),
+            }
+        )
+    }
+
+    fn u64_from_hex(s: &str) -> u64 {
+        let vec: Vec<u8> = s.from_hex().unwrap();
+        assert!(vec.len() <= 8);
+        let mut acc = 0;
+        for byte in vec {
+            acc = acc << 8 | byte as u64;
+        }
+        acc
+    }
 
     fn unpack3<T: Copy>(tup: &(T, &str, &str, &str))
                        -> (T, Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -1225,17 +1268,17 @@ mod tests {
         let mut enc = EcbRaw::new_encrypt(Aes::Aes128, &dummy[..16]);
         enc.start();
         enc.apply(&dummy, &mut res);
-        assert_eq!(enc.finish(), Err(Error::IncompleteBlock));
+        assert_match!(enc.finish(), Err(Error::IncompleteBlock));
 
         let mut dec = EcbRaw::new_decrypt(Aes::Aes128, &dummy[..16]);
         dec.start();
         dec.apply(&dummy, &mut res);
-        assert_eq!(dec.finish(), Err(Error::IncompleteBlock));
+        assert_match!(dec.finish(), Err(Error::IncompleteBlock));
 
         let mut dec = EcbPadded::new_decrypt(Aes::Aes128, &dummy[..16]);
         dec.start();
         dec.apply(&dummy, &mut res);
-        assert_eq!(dec.finish(&mut res), Err(Error::InvalidPadding));
+        assert_match!(dec.finish(&mut res), Err(Error::InvalidPadding));
     }
 
     #[test]
@@ -1482,17 +1525,17 @@ mod tests {
         let mut enc = CbcRaw::new_encrypt(Aes::Aes128, &dummy[..16]);
         enc.start(&dummy[..16]);
         enc.apply(&dummy, &mut res);
-        assert_eq!(enc.finish(), Err(Error::IncompleteBlock));
+        assert_match!(enc.finish(), Err(Error::IncompleteBlock));
 
         let mut dec = CbcRaw::new_decrypt(Aes::Aes128, &dummy[..16]);
         dec.start(&dummy[..16]);
         dec.apply(&dummy, &mut res);
-        assert_eq!(dec.finish(), Err(Error::IncompleteBlock));
+        assert_match!(dec.finish(), Err(Error::IncompleteBlock));
 
         let mut dec = CbcPadded::new_decrypt(Aes::Aes128, &dummy[..16]);
         dec.start(&dummy[..16]);
         dec.apply(&dummy, &mut res);
-        assert_eq!(dec.finish(&mut res), Err(Error::InvalidPadding));
+        assert_match!(dec.finish(&mut res), Err(Error::InvalidPadding));
     }
 
     #[test]
@@ -1835,7 +1878,7 @@ mod tests {
             }
             dec.apply(&pt, &mut res);
             let auth = dec.finish();
-            assert_eq!(auth, Err(Error::AuthFailed));
+            assert_match!(auth, Err(Error::AuthFailed));
 
             let mut dec = GcmDecrypt::new(algo, &key);
             if aad.len() > 0 {
@@ -1844,9 +1887,9 @@ mod tests {
             else {
                 dec.start(&iv, None, &tag);
             }
-            dec.apply(&garbage, &mut res);
+            dec.apply(garbage, &mut res);
             let auth = dec.finish();
-            assert_eq!(auth, Err(Error::AuthFailed));
+            assert_match!(auth, Err(Error::AuthFailed));
 
             n += 1;
         }
@@ -1894,8 +1937,8 @@ mod tests {
         for item in &CTR_VEC {
             println!("vec #{}", n);
             let (algo, key, _, _, pt, ct) = unpack5(item);
-            let iv: u64 = from_str_radix(item.2, 16).unwrap();
-            let ctr: u64 = from_str_radix(item.3, 16).unwrap();
+            let iv: u64 = u64_from_hex(item.2);
+            let ctr: u64 = u64_from_hex(item.3);
             let mut res: Vec<u8> = repeat(0).take(pt.len()).collect();
 
             let mut enc = Ctr::new(algo, &key);
@@ -1918,8 +1961,8 @@ mod tests {
         for item in &CTR_VEC {
             println!("vec #{}", n);
             let (algo, key, _, _, pt, ct) = unpack5(item);
-            let iv: u64 = from_str_radix(item.2, 16).unwrap();
-            let ctr: u64 = from_str_radix(item.3, 16).unwrap();
+            let iv: u64 = u64_from_hex(item.2);
+            let ctr: u64 = u64_from_hex(item.3);
             let mut res: Vec<u8> = repeat(0).take(pt.len()).collect();
 
             let mut enc = Ctr::new(algo, &key);
@@ -1943,8 +1986,8 @@ mod tests {
         for item in &CTR_VEC {
             println!("vec #{}", n);
             let (algo, key, _, _, pt, ct) = unpack5(item);
-            let iv: u64 = from_str_radix(item.2, 16).unwrap();
-            let ctr: u64 = from_str_radix(item.3, 16).unwrap();
+            let iv: u64 = u64_from_hex(item.2);
+            let ctr: u64 = u64_from_hex(item.3);
             let mut res: Vec<u8> = Vec::new();
 
             let mut enc = Ctr::new(algo, &key);
@@ -1986,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    #[should_fail]
+    #[should_panic]
     #[cfg(feature = "aes_ctr")]
     fn test_ctr_counter_overflow_panic() {
         let dummy_iv = 0u64;
